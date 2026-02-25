@@ -22,6 +22,110 @@ const DEFAULT_INDICATORS = [
   { id:"TFP_growth_2223_pct", label:"TFP growth (2022–23)", unit:"Percent", fmt:"0.0", proj:"TFP_growth_proj_2530_pct" },
 ];
 
+/** -------- Menu (UI-only, generated from APO_Menu_Structure_v1.xlsx) -------- */
+const MENU_TREE = Array.isArray(window.APO_MENU) ? window.APO_MENU : [];
+
+function _normKey(s){
+  return String(s||"").toLowerCase().replace(/[^a-z0-9]+/g,"");
+}
+
+/* Map wireframe indicator names -> current data.js indicator IDs (UI-only).
+   If an indicator is missing in data.js, the UI renders it as "Coming soon". */
+const MENU_TO_INDICATOR_ID = {
+  realgdp: "GDP_PPP_2023_bn",
+  realgdpgrowth: "GDP_growth_2223_pct",
+  percapitarealgdp: "GDPpc_PPP_2023_kUSD",
+  population: "Population_2022_m",
+  numberofemployment: "Employment_2023_thousand",
+  employmentrate: "Employment_rate_2023_pct",
+
+  perworkerlaborproductivity: "LP_level_per_worker_2023_kUSD",
+  perworkerlaborproductivitygrowth: "LP_growth_2223_pct",
+  perhourlaborproductivity: "LP_level_per_hour_2023_USD",
+  perhourlaborproductivitygrowth: "LP_growth_per_hour_2223_pct",
+
+  agriculturegdpshare: "Agri_share_GDP_2023_pct",
+  manufacturinggdpshare: "Mfg_share_GDP_2023_pct",
+
+  capitalproductivitygrowth: "Capital_prod_growth_2223_pct",
+  tfpgrowth: "TFP_growth_2223_pct",
+};
+
+/* Map wireframe indicator names -> trends time-series codes (best-effort).
+   If missing, "Trend & Compare" shows as disabled. */
+const MENU_TO_TS_CODE = {
+  // TEST BUILD (Option A): Pilot trends from Excel long-format CSV
+  // Only mapped indicators will enable "Trend & Compare"; others remain "Coming soon".
+  realgdp: "out_gdp_ppp_level",
+  population: "pop_total_level",
+  consumerpriceindexcpi: "price_cpi_index",
+  perworkerlaborproductivity: "prod_lp_per_worker_index",
+  perhourlaborproductivity: "prod_lp_per_hour_index",
+  tfpgrowth: "prod_tfp_index",
+};
+
+
+let _menuOpenGroups = new Set(loadLS("apo_menu_open_groups_v1", []) || []);
+let _menuOpenIndicators = new Set(loadLS("apo_menu_open_inds_v1", []) || []);
+let _menuQuery = "";
+let _menuInitDone = false;
+
+function saveMenuOpenState(){
+  saveLS("apo_menu_open_groups_v1", Array.from(_menuOpenGroups));
+  saveLS("apo_menu_open_inds_v1", Array.from(_menuOpenIndicators));
+}
+
+/* Tiny toast (UI-only). */
+let _toastTimer = null;
+function showToast(msg){
+  const id = "apoToast";
+  let el = document.getElementById(id);
+  if(!el){
+    el = document.createElement("div");
+    el.id = id;
+    el.style.position = "fixed";
+    el.style.left = "50%";
+    el.style.bottom = "16px";
+    el.style.transform = "translateX(-50%)";
+    el.style.zIndex = "999";
+    el.style.background = "rgba(0,0,0,.65)";
+    el.style.color = "white";
+    el.style.padding = "10px 12px";
+    el.style.borderRadius = "14px";
+    el.style.border = "1px solid rgba(255,255,255,.25)";
+    el.style.maxWidth = "min(520px, 92vw)";
+    el.style.fontWeight = "650";
+    el.style.boxShadow = "0 14px 40px rgba(0,0,0,.35)";
+    document.body.appendChild(el);
+  }
+  el.textContent = msg;
+  el.style.opacity = "1";
+  if(_toastTimer) clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(()=>{ el.style.opacity = "0"; }, 2200);
+}
+
+function inferRefPeriodFromLabel(label){
+  const s = String(label||"");
+  const m = s.match(/\(([^)]*)\)\s*$/); // last (...)
+  if(!m) return null;
+  const inner = m[1];
+  const yr = inner.match(/(19|20)\d{2}(?:\s*[–-]\s*(?:19|20)?\d{2,4})?/);
+  if(yr) return yr[0].replace(/\s+/g," ").replace("-", "–");
+  return null;
+}
+
+function resolveIndicatorForMenu(menuIndName){
+  const key = _normKey(menuIndName);
+  const mappedId = MENU_TO_INDICATOR_ID[key];
+  const ind = mappedId ? getIndicator(mappedId) : null;
+  return { key, mappedId, ind };
+}
+
+function resolveTsCodeForMenu(menuIndName){
+  const key = _normKey(menuIndName);
+  return MENU_TO_TS_CODE[key] || null;
+}
+
 /** -------- Helpers -------- */
 const $ = (sel)=>document.querySelector(sel);
 const $$ = (sel)=>Array.from(document.querySelectorAll(sel));
@@ -44,6 +148,13 @@ function fmtNumber(x, decimals=null){
   if(!isNum(x)) return "–";
   if(decimals === null) return x.toLocaleString();
   return x.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+}
+
+// Backward-compatible alias used throughout the UI rendering code.
+// Some modules call `fmt(...)` (historical name), while the canonical
+// implementation here is `fmtNumber(...)`.
+function fmt(x, decimals=null){
+  return fmtNumber(x, decimals);
 }
 
 /** -------- Data -------- */
@@ -70,7 +181,185 @@ const state = {
   tsEconomy: null,
   tsCompare: [],
   tsCompareOpen: false,
+  tsLocked: false,
+  tsEcoQuery: "",
+  tsAllOn: false,
 };
+
+
+/** -------- CSV-first contract scaffold (Option A migration, SAFE) --------
+  Goal: move toward CSV-first without breaking v8.
+  Rule: if data.js has a value, keep it. CSV is used only as fallback.
+  Files (GitHub Pages-ready):
+    - data/economies.csv
+    - data/indicators.csv
+    - data/trend_master.csv
+    - data/projection_baseline.csv
+-------------------------------------------------------------- */
+
+const CSV_FIRST = {
+  loaded: false,
+  // economies
+  econNameToCode: new Map(),   // dashboard economy name -> economy_code
+  econCodeToShort: new Map(),  // economy_code -> short_name
+  // indicators
+  indicatorById: new Map(),    // indicator_id -> {trend_series_id, transform, ref_period, ...}
+  // projection baseline (v4-derived)
+  projection: new Map(),       // proj_indicator_id -> Map(economy_code -> value)
+};
+
+/* CSV reader for contract files (reuses the app's quote-aware parser). */
+function _csvReadObjects(text){
+  const rows = parseCSV(String(text||""));
+  if(rows.length < 2) return [];
+  const header = rows[0].map(h => (h||"").trim().replace(/^\uFEFF/, ""));
+  return rows.slice(1).map(r=>{
+    const obj = {};
+    header.forEach((h, idx)=>{ obj[h] = (r[idx] ?? ""); });
+    return obj;
+  });
+}
+
+function _csvApplyTransform(val, transform){
+  if(!isNum(val)) return null;
+  const t = String(transform||"").trim();
+  if(!t) return val;
+  // supported: divide:1000  multiply:1000  add:...  subtract:...
+  const m = t.match(/^(divide|multiply|add|subtract):(-?\d+(?:\.\d+)?)$/i);
+  if(!m) return val;
+  const op = m[1].toLowerCase();
+  const k = Number(m[2]);
+  if(!Number.isFinite(k) || k === 0 && op === "divide") return val;
+  if(op === "divide") return val / k;
+  if(op === "multiply") return val * k;
+  if(op === "add") return val + k;
+  if(op === "subtract") return val - k;
+  return val;
+}
+
+function _parseRefYear(refPeriod){
+  // "2023" -> 2023 ; "2022–23" -> 2023 (end year) ; else null
+  const s = String(refPeriod||"");
+  const m = s.match(/(19|20)\d{2}(?:\D+(\d{2,4}))?/);
+  if(!m) return null;
+  if(m[2]){
+    const end = m[2].length === 2 ? Number(String(m[1]) + m[2]) : Number(m[2]);
+    return Number.isFinite(end) ? end : null;
+  }
+  const y = Number(m[0].slice(0,4));
+  return Number.isFinite(y) ? y : null;
+}
+
+function csvGetEconomyCode(dashboardEconomyName){
+  return CSV_FIRST.econNameToCode.get(dashboardEconomyName) || null;
+}
+
+function csvGetIndicatorRecord(indicatorId){
+  return CSV_FIRST.indicatorById.get(indicatorId) || null;
+}
+
+function csvGetProjectionValue(dashboardEconomyName, projIndicatorId){
+  if(!CSV_FIRST.loaded) return null;
+  const code = csvGetEconomyCode(dashboardEconomyName);
+  if(!code) return null;
+  const m = CSV_FIRST.projection.get(projIndicatorId);
+  if(!m) return null;
+  const v = m.get(code);
+  return isNum(v) ? v : null;
+}
+
+function csvGetDerivedDataValue(dashboardEconomyName, indicatorId){
+  if(!CSV_FIRST.loaded) return null;
+  const rec = csvGetIndicatorRecord(indicatorId);
+  if(!rec || !rec.trend_series_id) return null;
+
+  const code = csvGetEconomyCode(dashboardEconomyName);
+  if(!code) return null;
+
+  // Need trend master loaded to use _pilotByEco map (shared with Trends view)
+  if(!_pilotTrendsLoaded) return null;
+
+  const ecoMap = _pilotByEco.get(code);
+  if(!ecoMap) return null;
+  const yearMap = ecoMap.get(rec.trend_series_id);
+  if(!yearMap) return null;
+
+  // Prefer ref-year (keeps UI labels consistent); fallback to latest year available.
+  const refY = _parseRefYear(rec.ref_period);
+  let y = (refY && yearMap.has(refY)) ? refY : null;
+  if(y === null){
+    let maxY = -Infinity;
+    for(const yy of yearMap.keys()) maxY = Math.max(maxY, yy);
+    if(maxY === -Infinity) return null;
+    y = maxY;
+  }
+  const raw = yearMap.get(y);
+  const v = _csvApplyTransform(raw, rec.transform);
+  return isNum(v) ? v : null;
+}
+
+async function loadCsvContracts(){
+  if(CSV_FIRST.loaded) return;
+
+  // economies.csv
+  try{
+    const res = await fetch("data/economies.csv", { cache:"no-store" });
+    if(res.ok){
+      const rows = _csvReadObjects(await res.text());
+      rows.forEach(r=>{
+        const code = r.economy_code;
+        const dash = r.dashboard_name;
+        if(code) CSV_FIRST.econCodeToShort.set(code, r.short_name || code);
+        if(code && dash) CSV_FIRST.econNameToCode.set(dash, code);
+      });
+    }
+  }catch(_){}
+
+  // indicators.csv
+  try{
+    const res = await fetch("data/indicators.csv", { cache:"no-store" });
+    if(res.ok){
+      const rows = _csvReadObjects(await res.text());
+      rows.forEach(r=>{
+        const id = r.indicator_id;
+        if(!id) return;
+        CSV_FIRST.indicatorById.set(id, {
+          indicator_id: id,
+          trend_series_id: r.trend_series_id || "",
+          transform: r.transform || "",
+          ref_period: r.ref_period || "",
+          label: r.label || "",
+          unit: r.unit || "",
+          fmt: r.fmt || "",
+          proj_indicator_id: r.proj_indicator_id || ""
+        });
+      });
+    }
+  }catch(_){}
+
+  // projection_baseline.csv
+  try{
+    const res = await fetch("data/projection_baseline.csv", { cache:"no-store" });
+    if(res.ok){
+      const rows = _csvReadObjects(await res.text());
+      rows.forEach(r=>{
+        const pid = r.indicator_id;
+        const code = r.economy_code;
+        const v = Number(r.value);
+        if(!pid || !code || !Number.isFinite(v)) return;
+        if(!CSV_FIRST.projection.has(pid)) CSV_FIRST.projection.set(pid, new Map());
+        CSV_FIRST.projection.get(pid).set(code, v);
+      });
+    }
+  }catch(_){}
+
+  // Preload trend master into the shared pilot cache so derived-latest fallback can be synchronous.
+  try{
+    await loadPilotTrends();
+  }catch(_){ /* Trends view will show its own error if needed */ }
+
+  CSV_FIRST.loaded = true;
+}
 
 if(IS_ADMIN){
   const saved = loadLS("apo_indicator_defs_v1", null);
@@ -144,24 +433,211 @@ function switchView(view){
   renderAll();
 }
 
-/** -------- Sidebar indicators -------- */
-function renderIndicatorList(){
+/** -------- Sidebar menu (hierarchy) -------- */
+function renderMenuTree(){
   const wrap = $("#indicatorList");
   if(!wrap) return;
-  wrap.innerHTML = "";
 
-  INDICATORS.forEach(ind=>{
-    const b = document.createElement("button");
-    b.className = "indBtn" + (state.indicatorId === ind.id ? " active" : "");
-    b.textContent = ind.label;
-    b.addEventListener("click", ()=>{
-      state.indicatorId = ind.id;
-      renderIndicatorList();
-      if(state.view !== "indicators") switchView("indicators");
-      else renderIndicators();
+  // If MENU_TREE is missing, fall back to flat indicators (legacy).
+  if(!Array.isArray(MENU_TREE) || !MENU_TREE.length){
+    wrap.innerHTML = "";
+    INDICATORS.forEach(ind=>{
+      const b = document.createElement("button");
+      b.className = "indBtn" + (state.indicatorId === ind.id ? " active" : "");
+      b.textContent = ind.label;
+      b.addEventListener("click", ()=>{
+        state.indicatorId = ind.id;
+        if(state.view !== "indicators") switchView("indicators");
+        else renderIndicators();
+      });
+      wrap.appendChild(b);
     });
-    wrap.appendChild(b);
+    return;
+  }
+
+  // Default open state (only on first load) — so "Collapse all" really collapses.
+  if(!_menuInitDone && !_menuOpenGroups.size && MENU_TREE[0] && MENU_TREE[0].id){
+    _menuOpenGroups.add(MENU_TREE[0].id);
+  }
+
+  const q = (_menuQuery || "").trim().toLowerCase();
+
+  function textMatch(a){
+    if(!q) return true;
+    return String(a||"").toLowerCase().includes(q);
+  }
+
+  function modeKey(modeLabel){
+    const s = String(modeLabel||"").toLowerCase();
+    if(s.includes("nowcast")) return "nowcast";
+    if(s.includes("latest")) return "latest";
+    if(s.includes("trend")) return "trend";
+    if(s.includes("projection")) return "projection";
+    return "latest";
+  }
+
+  function closeSidebarIfMobile(){
+    const appEl = document.querySelector(".app");
+    if(!appEl) return;
+    if(window.matchMedia && window.matchMedia("(max-width: 980px)").matches){
+      appEl.classList.remove("sidebarOpen");
+    }
+  }
+
+  function goLatest(ind){
+    if(!ind) return;
+    state.indicatorId = ind.id;
+    state.mode = "data";
+    closeSidebarIfMobile();
+    switchView("indicators");
+  }
+
+  function goProjection(ind){
+    if(!ind) return;
+    state.indicatorId = ind.id;
+    state.mode = "projection";
+    closeSidebarIfMobile();
+    switchView("indicators");
+  }
+
+  function goTrend(menuIndName){
+    const code = resolveTsCodeForMenu(menuIndName);
+    if(!code){
+      showToast("Trend view is not mapped for this indicator yet (Coming soon).");
+      return;
+    }
+    state.tsIndicator = code;
+    state.tsLocked = true; // indicator already chosen from menu
+    closeSidebarIfMobile();
+    switchView("trends");
+  }
+
+  wrap.innerHTML = "";
+  MENU_TREE.forEach(group=>{
+    // Filter indicators by query
+    const visibleIndicators = (group.indicators || []).filter(mi=>{
+      if(!q) return true;
+      const resolved = resolveIndicatorForMenu(mi.name);
+      const label = resolved.ind ? resolved.ind.label : mi.name;
+      return textMatch(group.name) || textMatch(mi.name) || textMatch(label);
+    });
+    if(q && !visibleIndicators.length) return;
+
+    const groupOpen = q ? true : _menuOpenGroups.has(group.id);
+
+    const gEl = document.createElement("div");
+    gEl.className = "menuGroup";
+
+    const gBtn = document.createElement("button");
+    gBtn.className = "menuGroupBtn";
+    gBtn.innerHTML = `
+      <span>${escapeHtml(group.name)}</span>
+      <span class="chev">${groupOpen ? "▾" : "▸"}</span>
+    `;
+    gBtn.addEventListener("click", ()=>{
+      if(_menuOpenGroups.has(group.id)) _menuOpenGroups.delete(group.id);
+      else _menuOpenGroups.add(group.id);
+      saveMenuOpenState();
+      renderMenuTree();
+    });
+
+    gEl.appendChild(gBtn);
+
+    const items = document.createElement("div");
+    items.className = "menuItems";
+    items.style.display = groupOpen ? "block" : "none";
+
+    visibleIndicators.forEach(mi=>{
+      const resolved = resolveIndicatorForMenu(mi.name);
+      const ind = resolved.ind;
+      const ref = ind ? (inferRefPeriodFromLabel(ind.label) || "2023") : "YYYY";
+      const hasLatest = !!ind;
+      const hasProj = !!(ind && ind.proj && DATA.some(r=>r && isNum(r[ind.proj])));
+      const hasTrend = !!resolveTsCodeForMenu(mi.name);
+
+      const indKey = `${group.id}||${mi.id}`;
+      const open = q ? true : _menuOpenIndicators.has(indKey);
+
+      const card = document.createElement("div");
+      card.className = "menuInd";
+
+      const header = document.createElement("div");
+      header.className = "menuIndHeader";
+
+      const btn = document.createElement("button");
+      btn.className = "menuIndBtn" + (ind && state.indicatorId === ind.id ? " active" : "");
+      btn.innerHTML = `
+        <span class="menuIndLabel">${escapeHtml(cleanIndicatorTitle(mi.name || (ind ? ind.label : "")))}</span>
+        <span class="chev">${open ? "▾" : "▸"}</span>
+      `;
+      btn.addEventListener("click", ()=>{
+        if(_menuOpenIndicators.has(indKey)) _menuOpenIndicators.delete(indKey);
+        else _menuOpenIndicators.add(indKey);
+        saveMenuOpenState();
+        renderMenuTree();
+      });
+
+      const badge = document.createElement("span");
+      badge.className = "menuBadge " + (ind ? "ok" : "soon");
+      badge.textContent = ind ? "Available" : "Coming soon";
+
+      header.appendChild(btn);
+      header.appendChild(badge);
+      card.appendChild(header);
+
+      const modes = document.createElement("div");
+      modes.className = "menuModes";
+      modes.style.display = open ? "block" : "none";
+
+      (mi.modes || []).forEach(m=>{
+        const k = modeKey(m);
+        let label = m;
+        let disabled = false;
+        let active = false;
+
+        if(k === "latest"){
+          label = `Latest available (official): ${ref}`;
+          disabled = !hasLatest;
+          active = !!(ind && state.view === "indicators" && state.indicatorId === ind.id && state.mode === "data");
+        }else if(k === "projection"){
+          label = "Projection";
+          disabled = !hasProj;
+          active = !!(ind && state.view === "indicators" && state.indicatorId === ind.id && state.mode === "projection");
+        }else if(k === "trend"){
+          label = "Trend & Compare";
+          disabled = !hasTrend;
+          active = (state.view === "trends" && resolveTsCodeForMenu(mi.name) === state.tsIndicator);
+        }else if(k === "nowcast"){
+          label = "Nowcast (estimate)";
+          disabled = true; // UI placeholder only
+        }
+
+        const b = document.createElement("button");
+        b.className = "modeBtn" + (active ? " active" : "");
+        b.innerHTML = `<span class="modeDot" aria-hidden="true"></span><span class="modeText">${escapeHtml(label)}</span>`;
+        if(disabled) b.disabled = true;
+        b.addEventListener("click", ()=>{
+          if(disabled){
+            showToast("This view is coming soon.");
+            return;
+          }
+          if(k === "latest") goLatest(ind);
+          else if(k === "projection") goProjection(ind);
+          else if(k === "trend") goTrend(mi.name);
+          else showToast("This view is coming soon.");
+        });
+        modes.appendChild(b);
+      });
+
+      card.appendChild(modes);
+      items.appendChild(card);
+    });
+
+    gEl.appendChild(items);
+    wrap.appendChild(gEl);
   });
+
+  _menuInitDone = true;
 }
 
 /** -------- Summary -------- */
@@ -860,25 +1336,48 @@ GDP: ${isNum(p.s)?fmtNumber(p.s):"–"}</title>
 
   // ---- Render ----
   root.innerHTML = `
-    <div class="grid">
-      <div class="tile clickable" id="tileTotalGdp">
-        <div class="tileLabel">Total GDP in 2023 (Billion USD, 2023)</div>
-        <div class="tileValue">${fmtNumber(gdp, 1)}T</div>
-        <div class="tileSub">PPP-based (Databook convention) · Click to view breakdown</div>
-      </div>
-      <div class="tile">
-        <div class="tileLabel">Avg. GDP growth (2022–23)</div>
-        <div class="tileValue">${isNum(gdpGrowth) ? fmtNumber(gdpGrowth, 1) + "%" : "–"}</div>
-        <div class="tileSub">Average over economies with available data</div>
-      </div>
-      <div class="tile">
-        <div class="tileLabel">Avg. TFP growth (2022–23)</div>
-        <div class="tileValue">${isNum(tfp) ? fmtNumber(tfp, 1) + "%" : "–"}</div>
-        <div class="tileSub">Average over economies with available data</div>
-      </div>
-    </div>
+    <div class="summaryStack">
 
-    ${execSummaryHtml}
+      <div class="card nowcastCard">
+        <div class="cardHeader">
+          <div>
+            <div class="cardTitle">Nowcast (estimate) summary</div>
+            <div class="cardSub">Placeholder section — this will show near-term nowcast signals once the nowcast dataset is defined.</div>
+          </div>
+        </div>
+        <div class="nowcastBody">
+          <div class="muted">Coming soon: quick nowcast cards (e.g., short-run growth, inflation, labor signals) with economy-level highlights.</div>
+        </div>
+      </div>
+
+      <div class="card summarySnapshotCard">
+        <div class="cardHeader">
+          <div>
+            <div class="cardTitle">Key snapshot</div>
+            <div class="cardSub">Quick portfolio indicators computed from the current dataset (missing values skipped).</div>
+          </div>
+          <button class="btnInlineGhost" id="tileTotalGdp" title="Open GDP breakdown">GDP breakdown</button>
+        </div>
+        <div class="kpiGrid kpiGrid3">
+          <div class="kpi">
+            <div class="kpiK">Total GDP (PPP)</div>
+            <div class="kpiV">${isNum(gdp) ? fmtNumber(gdp, 1) : "–"}</div>
+            <div class="kpiS">Billion USD, 2023</div>
+          </div>
+          <div class="kpi">
+            <div class="kpiK">Avg. GDP growth</div>
+            <div class="kpiV">${isNum(gdpGrowth) ? fmtNumber(gdpGrowth, 1) + "%" : "–"}</div>
+            <div class="kpiS">2022–23</div>
+          </div>
+          <div class="kpi">
+            <div class="kpiK">Avg. TFP growth</div>
+            <div class="kpiV">${isNum(tfp) ? fmtNumber(tfp, 1) + "%" : "–"}</div>
+            <div class="kpiS">2022–23</div>
+          </div>
+        </div>
+      </div>
+
+      ${execSummaryHtml}
     ${portSegHtml}
     ${comparatorHtml}
     ${concHtml}
@@ -1010,6 +1509,7 @@ GDP: ${isNum(p.s)?fmtNumber(p.s):"–"}</title>
       </div>
 
       <div class="cardSub" style="margin-top:10px;">Validation: Each leaderboard is computed by sorting numeric values from the corresponding indicator column.</div>
+    </div>
     </div>
   `;
 
@@ -1176,8 +1676,8 @@ function sortedRows(ind){
   const useData = (mode !== "projection");
 
   function pickVal(r){
-    const dv = isNum(r[ind.id]) ? r[ind.id] : null;
-    const pv = (ind.proj && isNum(r[ind.proj])) ? r[ind.proj] : null;
+    const dv = isNum(r[ind.id]) ? r[ind.id] : csvGetDerivedDataValue(r.Economy, ind.id);
+    const pv = (ind.proj && isNum(r[ind.proj])) ? r[ind.proj] : (ind.proj ? csvGetProjectionValue(r.Economy, ind.proj) : null);
     if(mode === "data") return dv;
     if(mode === "projection") return pv;
     if(useData && useProj) return (isNum(dv) ? dv : (isNum(pv) ? pv : null));
@@ -1456,6 +1956,30 @@ function renderProfile(){
       renderProfile();
     });
   }
+}
+
+
+function cleanIndicatorTitle(title){
+  if(!title) return title;
+  let t = String(title).trim();
+
+  // Remove trailing parenthetical only if it contains year and/or units
+  t = t.replace(/\s*\(([^)]*)\)\s*$/, (m, inside)=>{
+    const s = String(inside||"").toLowerCase();
+    const hasYear = /\b(19|20)\d{2}\b/.test(s) || /\b(19|20)\d{2}\s*[-–]\s*\d{2,4}\b/.test(s);
+    const hasUnits = /(usd|ppp|thousand|million|billion|percent|%|persons|workers|hours|index|points)/.test(s);
+    if(hasYear || hasUnits) return "";
+    return m;
+  });
+
+  // Remove trailing "in 2023" / "in 2022–23"
+  t = t.replace(/\s+in\s+\b(19|20)\d{2}(\s*[-–]\s*\d{2,4})?\b\s*$/i, "");
+
+  // Remove trailing standalone year " 2023"
+  t = t.replace(/\s+\b(19|20)\d{2}\b\s*$/i, "");
+
+  t = t.replace(/\s{2,}/g, " ").trim();
+  return t;
 }
 
 function escapeHtml(s){
@@ -1804,6 +2328,8 @@ async function handleCsvUpload(file){
   state.sourceFile = file.name || "Data_Master.csv";
   autoExtendIndicatorsFromData();
   updateCounts();
+  // CSV-first scaffold: load contracts in background (safe; does not override packaged values)
+  loadCsvContracts().catch(()=>{});
   renderAll();
 }
 
@@ -1818,7 +2344,7 @@ async function handleIndicatorJsonUpload(file){
 
   INDICATORS = defs;
   saveLS("apo_indicator_defs_v1", INDICATORS);
-  renderIndicatorList();
+  renderMenuTree();
   renderAll();
 }
 
@@ -1850,11 +2376,159 @@ function makeDataJs(){
 
 /** -------- Trends (time series) -------- */
 
+/* =======================
+   TEST BUILD (Option A): Pilot trends loader (additive only)
+   - Uses: data/pilot/trend_master_from_excel_pilot11.csv
+   - Scope: Trend & Compare view ONLY
+   - Keeps existing data.js (Latest/Projection) unchanged
+   ======================= */
+
+const PILOT_TRENDS_ENABLED = true;
+const PILOT_TRENDS_CSV_PRIMARY = "data/trend_master.csv";
+const PILOT_TRENDS_CSV_FALLBACK = "data/pilot/trend_master_from_excel_pilot11.csv";
+
+// Friendly names for pilot indicators (shown in the Trends picker)
+const PILOT_INDICATOR_LABELS = {
+  out_gdp_ppp_level: { label: "Real GDP (PPP), level", unit: "" },
+  pop_total_level: { label: "Population, level", unit: "" },
+  lab_hours_worked_level: { label: "Total hours worked, level", unit: "" },
+  prod_lp_per_worker_index: { label: "Labor productivity per worker (index)", unit: "Index" },
+  prod_lp_per_hour_index: { label: "Labor productivity per hour (index)", unit: "Index" },
+  prod_tfp_index: { label: "Total factor productivity (index)", unit: "Index" },
+  price_cpi_index: { label: "Consumer price index (index)", unit: "Index" },
+  out_ppp_gdp_rate: { label: "PPP conversion rate (GDP)", unit: "" },
+  dem_private_cons_ppp_level: { label: "Private consumption (PPP), level", unit: "" },
+  dem_gov_cons_ppp_level: { label: "Government consumption (PPP), level", unit: "" },
+  dem_gfcf_ppp_level: { label: "Gross fixed capital formation (PPP), level", unit: "" },
+};
+
+// --- Pilot/UI crosswalk (keep UI labels consistent with the left menu) ---
+// The left menu uses UI-friendly names (from menu.js). The Excel pilot file uses
+// technical indicator_id codes. We map by stable codes and *display* the left-menu label.
+function buildMenuKeyToLabel(){
+  const m = new Map();
+  try{
+    (MENU_TREE||[]).forEach(g=>{
+      (g.indicators||[]).forEach(ind=>{
+        const k = _normKey(ind.name);
+        if(k) m.set(k, ind.name);
+      });
+    });
+  }catch(e){}
+  return m;
+}
+
+const _MENU_KEY_TO_LABEL = buildMenuKeyToLabel();
+const _ALLOWED_PILOT_TS_CODES = new Set(Object.values(MENU_TO_TS_CODE||{}));
+
+function pilotLabelForTsCode(code){
+  // Find the menu key that maps to this ts code
+  for(const k in (MENU_TO_TS_CODE||{})){
+    if(MENU_TO_TS_CODE[k] === code){
+      return _MENU_KEY_TO_LABEL.get(k) || (PILOT_INDICATOR_LABELS[code]?.label) || code;
+    }
+  }
+  return (PILOT_INDICATOR_LABELS[code]?.label) || code;
+}
+
+let _pilotTrendsLoaded = false;
+let _pilotMeta = null;               // {years, indicators, economies, groups}
+let _pilotByEco = new Map();         // abbr -> Map(indicator_id -> Map(year -> value))
+
+function _parseCsvLineSimple(line){
+  // Pilot CSV has no quoted commas; keep parser minimal & fast.
+  const parts = line.split(",");
+  if(parts.length < 4) return null;
+  const indicator_id = parts[0];
+  const economy_code = parts[1];
+  const year = parseInt(parts[2], 10);
+  const value = parts[3] === "" ? null : Number(parts[3]);
+  if(!indicator_id || !economy_code || !Number.isFinite(year)) return null;
+  return { indicator_id, economy_code, year, value: Number.isFinite(value) ? value : null };
+}
+
+async function loadPilotTrends(){
+  if(_pilotTrendsLoaded) return { meta:_pilotMeta, byEco:_pilotByEco };
+
+  const res = await fetch(PILOT_TRENDS_CSV, { cache: "no-store" });
+  if(!res.ok) throw new Error("Failed to load pilot trend_master CSV");
+  const text = await res.text();
+
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  if(lines.length < 2) throw new Error("Pilot trend CSV is empty");
+
+  const indicatorsSet = new Set();
+  const economiesSet = new Set();
+  let minY = Infinity, maxY = -Infinity;
+
+  // Parse rows
+  for(let i=1; i<lines.length; i++){
+    const row = _parseCsvLineSimple(lines[i]);
+    if(!row) continue;
+    indicatorsSet.add(row.indicator_id);
+    economiesSet.add(row.economy_code);
+    minY = Math.min(minY, row.year);
+    maxY = Math.max(maxY, row.year);
+
+    if(!_pilotByEco.has(row.economy_code)) _pilotByEco.set(row.economy_code, new Map());
+    const ecoMap = _pilotByEco.get(row.economy_code);
+
+    if(!ecoMap.has(row.indicator_id)) ecoMap.set(row.indicator_id, new Map());
+    const indMap = ecoMap.get(row.indicator_id);
+
+    indMap.set(row.year, row.value);
+  }
+
+  if(minY === Infinity || maxY === -Infinity) throw new Error("Pilot trend CSV has no valid rows");
+
+  const years = [];
+  for(let y=minY; y<=maxY; y++) years.push(y);
+
+  // Only expose pilot indicators that are mapped to the v8 menu (additive integration rule).
+  // Anything else in the pilot CSV is kept in memory but not shown in the UI yet.
+  const indicators = Array.from(indicatorsSet)
+    .filter(code => _ALLOWED_PILOT_TS_CODES.has(code))
+    .sort()
+    .map(code=>{
+      const meta = PILOT_INDICATOR_LABELS[code] || { label: code, unit: "" };
+      const label = pilotLabelForTsCode(code);
+      return { code, label, unit: meta.unit || "", group: "Pilot (Excel)" };
+    });
+
+  const economies = Array.from(economiesSet).sort().map(abbr=>({ abbr, short: abbr }));
+
+  _pilotMeta = {
+    years,
+    groups: ["Pilot (Excel)"],
+    indicators,
+    economies,
+    note: "Pilot trends (Excel-derived long-format series).",
+  };
+
+  // defaults / safety: keep tsIndicator within the allowed pilot list
+  if(indicators.length){
+    const ok = indicators.some(d=>d.code === state.tsIndicator);
+    if(!ok) state.tsIndicator = indicators[0].code;
+  }
+  if(!state.tsEconomy && economies.length) state.tsEconomy = economies[0].abbr;
+
+  _pilotTrendsLoaded = true;
+  return { meta:_pilotMeta, byEco:_pilotByEco };
+}
+
 let _tsInitDone = false;
 let _tsRenderToken = 0;
 const _tsCache = new Map(); // abbr -> {economy, series}
 
 async function loadTsMeta(){
+  // TEST BUILD: Use pilot trends only for the Trends view.
+  if(PILOT_TRENDS_ENABLED){
+    const pilot = await loadPilotTrends();
+    state.tsMeta = pilot.meta;
+    return pilot.meta;
+  }
+
+  // Fallback (legacy packaged JSON)
   if(state.tsMeta) return state.tsMeta;
   const res = await fetch("data/ts_meta.json", { cache: "no-store" });
   if(!res.ok) throw new Error("Failed to load ts_meta.json");
@@ -1871,6 +2545,26 @@ async function loadTsMeta(){
 }
 
 async function loadTsEconomy(abbr){
+  // TEST BUILD: pilot data (CSV) -> match legacy shape {economy, series:{code:[...]}}
+  if(PILOT_TRENDS_ENABLED){
+    await loadPilotTrends();
+    const meta = _pilotMeta;
+    const years = (meta && meta.years) ? meta.years : [];
+    const ecoMap = _pilotByEco.get(abbr) || new Map();
+
+    // build full series object for this economy (all indicators)
+    const series = {};
+    (meta.indicators || []).forEach(ind=>{
+      const yearMap = ecoMap.get(ind.code) || new Map();
+      series[ind.code] = years.map(y => (yearMap.has(y) ? yearMap.get(y) : null));
+    });
+
+    const obj = { economy: abbr, series };
+    _tsCache.set(abbr, obj);
+    return obj;
+  }
+
+  // legacy JSON loader
   if(_tsCache.has(abbr)) return _tsCache.get(abbr);
   const res = await fetch(`data/ts/${abbr}.json`, { cache: "no-store" });
   if(!res.ok) throw new Error(`Failed to load data/ts/${abbr}.json`);
@@ -1879,47 +2573,75 @@ async function loadTsEconomy(abbr){
   return obj;
 }
 
+
+function syncTrendsPickerVisibility(){
+  const picker = document.querySelector("#tsIndicatorPicker");
+  if(picker) picker.style.display = state.tsLocked ? "none" : "flex";
+}
+
 function initTrendsUI(){
   if(_tsInitDone) return;
   _tsInitDone = true;
 
   const indSel = document.querySelector("#tsIndicatorSelect");
   const ecoSel = document.querySelector("#tsEconomySelect");
-  const compareBtn = document.querySelector("#tsCompareBtn");
-  const comparePanel = document.querySelector("#tsComparePanel");
+  const ecoSearch = document.querySelector("#tsEconomySearch");
+  const allOnBtn = document.querySelector("#tsAllOn");
+  const allOffBtn = document.querySelector("#tsAllOff");
+  const picker = document.querySelector("#tsIndicatorPicker");
+
+  function syncPickerVisibility(){
+    syncTrendsPickerVisibility();
+  }
 
   const onChange = () => {
-    state.tsIndicator = indSel.value || state.tsIndicator;
-    state.tsEconomy = ecoSel.value || state.tsEconomy;
+    if(indSel) state.tsIndicator = indSel.value || state.tsIndicator;
+    if(ecoSel) state.tsEconomy = ecoSel.value || state.tsEconomy;
     // remove primary from compare list if present
     state.tsCompare = (state.tsCompare || []).filter(x => x && x !== state.tsEconomy);
     renderTrends();
   };
 
-  indSel.addEventListener("change", onChange);
-  ecoSel.addEventListener("change", onChange);
+  if(indSel){
+    indSel.addEventListener("change", ()=>{ state.tsLocked = false; syncPickerVisibility(); onChange(); });
+  }
+  if(ecoSel) ecoSel.addEventListener("change", onChange);
 
-  compareBtn.addEventListener("click", () => {
-    state.tsCompareOpen = !state.tsCompareOpen;
-    comparePanel.classList.toggle("hidden", !state.tsCompareOpen);
-  });
+  if(ecoSearch){
+    ecoSearch.addEventListener("input", ()=>{
+      state.tsEcoQuery = ecoSearch.value || "";
+      renderTrends();
+    });
+  }
+
+  if(allOnBtn){
+    allOnBtn.addEventListener("click", ()=>{ state.tsAllOn = true; renderTrends(); state.tsAllOn = false; });
+  }
+  if(allOffBtn){
+    allOffBtn.addEventListener("click", ()=>{ state.tsCompare = []; renderTrends(); });
+  }
+
+  syncPickerVisibility();
 
   // lazy-load meta and populate controls
   loadTsMeta()
     .then(meta => {
       populateTrendsControls(meta);
       renderTrends();
+      syncPickerVisibility();
     })
     .catch(err => {
-      document.querySelector("#tsChart").innerHTML =
-        `<div class="muted">Unable to load trends data. ${escapeHtml(err.message || String(err))}</div>`;
+      const el = document.querySelector("#tsChart");
+      if(el) el.innerHTML = `<div class="muted">Unable to load trends data. ${escapeHtml(err.message || String(err))}</div>`;
     });
 }
 
 function populateTrendsControls(meta){
   const indSel = document.querySelector("#tsIndicatorSelect");
   const ecoSel = document.querySelector("#tsEconomySelect");
-  const comparePanel = document.querySelector("#tsComparePanel");
+  const checklist = document.querySelector("#tsEconomyChecklist");
+  const labelEl = document.querySelector("#tsSelectedIndicatorLabel");
+  const subEl = document.querySelector("#tsSelectedIndicatorSub");
 
   // indicator dropdown (grouped)
   if(!indSel.dataset.populated){
@@ -1942,7 +2664,7 @@ function populateTrendsControls(meta){
       items.forEach(it => {
         const opt = document.createElement("option");
         opt.value = it.code;
-        opt.textContent = `${it.label}${it.unit ? ` (${it.unit})` : ""}`;
+        opt.textContent = `${it.label}`;
         og.appendChild(opt);
       });
       indSel.appendChild(og);
@@ -1956,7 +2678,7 @@ function populateTrendsControls(meta){
       byGroup[g].forEach(it => {
         const opt = document.createElement("option");
         opt.value = it.code;
-        opt.textContent = `${it.label}${it.unit ? ` (${it.unit})` : ""}`;
+        opt.textContent = `${it.label}`;
         og.appendChild(opt);
       });
       indSel.appendChild(og);
@@ -1981,52 +2703,34 @@ function populateTrendsControls(meta){
   if(state.tsIndicator) indSel.value = state.tsIndicator;
   if(state.tsEconomy) ecoSel.value = state.tsEconomy;
 
-  // compare list
-  const econs = meta.economies || [];
-  comparePanel.innerHTML = `
-    <div class="compareHeader">
-      <div class="muted">Select additional economies to compare</div>
-      <div class="compareActions">
-        <button class="btnInlineGhost" id="tsAllOffBtn" type="button">All off</button>
-      </div>
-    </div>
-    <div class="compareGrid" id="tsCompareGrid"></div>
-  `;
+  // Selected indicator label
+  const ind = (meta.indicators || []).find(x => x.code === state.tsIndicator);
+  if(labelEl) labelEl.textContent = ind ? (ind.label || "Indicator") : "Indicator";
+  if(subEl){
+    subEl.textContent = state.tsLocked ? "Selected from the indicator menu." : "You can change the indicator here.";
+  }
 
-  const grid = comparePanel.querySelector("#tsCompareGrid");
-  econs.forEach(e => {
-    if(e.abbr === state.tsEconomy) return;
-    const id = `ts_cmp_${e.abbr}`;
-    const item = document.createElement("label");
-    item.className = "compareItem";
-    item.innerHTML = `
-      <input type="checkbox" id="${id}" value="${escapeHtml(e.abbr)}">
-      <span>${escapeHtml(e.short || e.abbr)}</span>
-    `;
-    grid.appendChild(item);
-  });
+  // Economy checklist (Explorer-style list)
+  if(checklist && !checklist.dataset.populated){
+    checklist.dataset.populated = "1";
+    checklist.innerHTML = (meta.economies || []).map(e=>{
+      const nm = e.short || e.abbr;
+      return `<label class="trendCheckItem"><input type="checkbox" value="${escapeHtml(e.abbr)}"/><span>${escapeHtml(nm)}</span></label>`;
+    }).join("");
 
-  // apply current compare selections
-  const setChecks = () => {
-    (state.tsCompare || []).forEach(abbr => {
-      const box = grid.querySelector(`input[value="${CSS.escape(abbr)}"]`);
-      if(box) box.checked = true;
+    checklist.addEventListener("change", ()=>{
+      const boxes = Array.from(checklist.querySelectorAll('input[type="checkbox"]'));
+      const checked = boxes.filter(b=>b.checked).map(b=>b.value);
+      if(!checked.length){
+        const first = boxes[0];
+        if(first){ first.checked = true; state.tsEconomy = first.value; state.tsCompare = []; }
+      } else {
+        state.tsEconomy = checked[0];
+        state.tsCompare = checked.slice(1);
+      }
+      renderTrends();
     });
-  };
-  setChecks();
-
-  // events
-  grid.addEventListener("change", () => {
-    const chosen = Array.from(grid.querySelectorAll("input[type=checkbox]:checked")).map(x => x.value);
-    state.tsCompare = chosen;
-    renderTrends();
-  });
-
-  comparePanel.querySelector("#tsAllOffBtn").addEventListener("click", () => {
-    state.tsCompare = [];
-    Array.from(grid.querySelectorAll("input[type=checkbox]")).forEach(x => x.checked = false);
-    renderTrends();
-  });
+  }
 }
 
 function renderTrends(){
@@ -2036,6 +2740,7 @@ function renderTrends(){
 
   // ensure controls exist and meta is loading
   initTrendsUI();
+  syncTrendsPickerVisibility();
 
   // only render chart when on trends view (avoid unnecessary fetches)
   if(state.view !== "trends") return;
@@ -2053,6 +2758,34 @@ function renderTrends(){
 
       // ensure selects reflect state
       populateTrendsControls(meta);
+
+      // Sync checklist selections + filter
+      const checklist = document.querySelector("#tsEconomyChecklist");
+      if(checklist){
+        const boxes = Array.from(checklist.querySelectorAll('input[type="checkbox"]'));
+
+        // All on (select all) — limited to keep chart readable
+        if(state.tsAllOn){
+          // select up to 6 economies (primary + 5) to avoid clutter
+          boxes.forEach(b=> b.checked = false);
+          const take = boxes.slice(0, Math.min(6, boxes.length));
+          take.forEach(b=> b.checked = true);
+          const checked = take.map(b=>b.value);
+          state.tsEconomy = checked[0] || state.tsEconomy;
+          state.tsCompare = checked.slice(1);
+        }
+
+        const selected = new Set([state.tsEconomy, ...(state.tsCompare||[])]);
+        boxes.forEach(b=>{ b.checked = selected.has(b.value); });
+
+        const q = (state.tsEcoQuery || "").trim().toLowerCase();
+        boxes.forEach(b=>{
+          const item = b.closest('.trendCheckItem');
+          if(!item) return;
+          const t = (item.textContent || "").toLowerCase();
+          item.style.display = (!q || t.includes(q)) ? "" : "none";
+        });
+      }
 
       const indCode = state.tsIndicator;
       const ind = (meta.indicators || []).find(x => x.code === indCode);
@@ -2084,7 +2817,11 @@ function renderTrends(){
     })
     .catch(err => {
       if(token !== _tsRenderToken) return;
-      chartEl.innerHTML = `<div class="muted">Unable to render trends. ${escapeHtml(err.message || String(err))}</div>`;
+      const msg = (err && err.message) ? err.message : String(err);
+      const hint = /Failed to fetch/i.test(msg)
+        ? " (Tip: open via GitHub Pages or a local web server — browsers block fetch() on file://)"
+        : "";
+      chartEl.innerHTML = `<div class="muted">Unable to render trends. ${escapeHtml(msg)}${escapeHtml(hint)}</div>`;
     });
 }
 
@@ -2315,7 +3052,7 @@ function drawTimeSeriesChart(container, years, seriesList, opts){
 /** -------- Render router -------- */
 function renderAll(){
   updateCounts();
-  renderIndicatorList();
+  renderMenuTree();
 
   if(state.view === "summary") renderSummary();
   if(state.view === "indicators") renderIndicators();
@@ -2328,18 +3065,68 @@ function renderAll(){
 function init(){
   setTheme(state.theme);
   autoExtendIndicatorsFromData();
-  renderIndicatorList();
+  renderMenuTree();
   updateCounts();
 
+  // CSV-first scaffold: load contracts in background (safe; does not override packaged values)
+  loadCsvContracts().catch(()=>{});
+
   $$(".navItem").forEach(b=>{
-    b.addEventListener("click", ()=> switchView(b.dataset.view));
+    b.addEventListener("click", ()=>{ switchView(b.dataset.view); closeSidebarIfMobile(); });
   });
 
   const home = $("#brandHome");
   const homeGo = ()=>{ switchView("summary"); };
   if(home){
-    home.addEventListener("click", homeGo);
-    home.addEventListener("keydown",(e)=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); homeGo(); }});
+    home.addEventListener("click", ()=>{ homeGo(); closeSidebarIfMobile(); });
+    home.addEventListener("keydown",(e)=>{ if(e.key==="Enter"||e.key===" "){ e.preventDefault(); homeGo(); closeSidebarIfMobile(); }});
+  }
+
+  // Sidebar (mobile drawer)
+  const appEl = document.querySelector(".app");
+  const sbToggle = $("#sidebarToggle");
+  const sbOverlay = $("#sidebarOverlay");
+  function closeSidebarIfMobile(){
+    if(!appEl) return;
+    if(window.matchMedia && window.matchMedia("(max-width: 980px)").matches){
+      appEl.classList.remove("sidebarOpen");
+    }
+  }
+  function toggleSidebar(){
+    if(!appEl) return;
+    appEl.classList.toggle("sidebarOpen");
+  }
+  if(sbToggle) sbToggle.addEventListener("click", toggleSidebar);
+  if(sbOverlay) sbOverlay.addEventListener("click", closeSidebarIfMobile);
+
+  // Sidebar menu controls
+  const menuSearch = $("#menuSearch");
+  if(menuSearch){
+    menuSearch.addEventListener("input", (e)=>{
+      _menuQuery = e.target.value || "";
+      renderMenuTree();
+    });
+  }
+  const collapseAllBtn = $("#menuCollapseAllBtn");
+  const expandAllBtn = $("#menuExpandAllBtn");
+  if(collapseAllBtn){
+    collapseAllBtn.addEventListener("click", ()=>{
+      _menuOpenGroups = new Set();
+      _menuOpenIndicators = new Set();
+      saveMenuOpenState();
+      renderMenuTree();
+    });
+  }
+  if(expandAllBtn){
+    expandAllBtn.addEventListener("click", ()=>{
+      _menuOpenGroups = new Set((MENU_TREE||[]).map(g=>g.id).filter(Boolean));
+      _menuOpenIndicators = new Set();
+      (MENU_TREE||[]).forEach(g=>{
+        (g.indicators||[]).forEach(i=> _menuOpenIndicators.add(`${g.id}||${i.id}`));
+      });
+      saveMenuOpenState();
+      renderMenuTree();
+    });
   }
 
   const search = $("#searchBox");
@@ -2390,6 +3177,7 @@ function init(){
     if(e.key === "Escape"){
       closeGdpModal();
       closeGlossary();
+      closeSidebarIfMobile();
     }
   });
 
@@ -2435,7 +3223,7 @@ function init(){
       resetIndicatorsBtn.addEventListener("click", ()=>{
         INDICATORS = deepClone(PACKAGED_INDICATORS);
         saveLS("apo_indicator_defs_v1", INDICATORS);
-        renderIndicatorList();
+        renderMenuTree();
         renderAll();
       });
     }
