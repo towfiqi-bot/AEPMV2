@@ -2450,9 +2450,22 @@ function _parseCsvLineSimple(line){
 async function loadPilotTrends(){
   if(_pilotTrendsLoaded) return { meta:_pilotMeta, byEco:_pilotByEco };
 
-  const res = await fetch(PILOT_TRENDS_CSV, { cache: "no-store" });
-  if(!res.ok) throw new Error("Failed to load pilot trend_master CSV");
-  const text = await res.text();
+  // Prefer primary CSV; fall back to legacy pilot path if needed (GitHub Pages caching safe).
+  let text = null;
+  {
+    const urls = [PILOT_TRENDS_CSV_PRIMARY, PILOT_TRENDS_CSV_FALLBACK];
+    let lastErr = null;
+    for(const u of urls){
+      try{
+        const res = await fetch(u, { cache: "no-store" });
+        if(res && res.ok){ text = await res.text(); lastErr = null; break; }
+        lastErr = new Error("HTTP " + (res ? res.status : "0") + " for " + u);
+      }catch(e){ lastErr = e; }
+    }
+    if(text === null){
+      throw new Error("Failed to load pilot trend_master CSV" + (lastErr ? (": " + (lastErr.message||lastErr)) : ""));
+    }
+  }
 
   const lines = text.split(/\r?\n/).filter(Boolean);
   if(lines.length < 2) throw new Error("Pilot trend CSV is empty");
@@ -3246,4 +3259,116 @@ function init(){
   switchView("summary");
 }
 
-init();
+
+/** =======================
+    CSV-first runtime bootstrap (no data.js required)
+    - Builds DATA rows for the dashboard from:
+      1) data/dashboard_profiles.csv (20 dashboard economies + narratives)
+      2) data/trend_master.csv (numeric snapshot + long series)
+      3) data/projection_baseline.csv (projection placeholders)
+    - If any piece is missing, the UI will show "Coming soon" (no fake data).
+   ======================= */
+
+function _maxYearFromMap(yearMap){
+  let maxY = -Infinity;
+  if(!yearMap) return null;
+  for(const [y,v] of yearMap.entries()){
+    if(v === null || v === undefined) continue;
+    if(Number.isFinite(v)) maxY = Math.max(maxY, y);
+  }
+  return (maxY === -Infinity) ? null : maxY;
+}
+
+function _latestValueFromByEco(byEco, ecoCode, indicatorId){
+  const ecoMap = byEco && byEco.get(ecoCode);
+  if(!ecoMap) return "";
+  const yearMap = ecoMap.get(indicatorId);
+  if(!yearMap) return "";
+  const maxY = _maxYearFromMap(yearMap);
+  if(maxY === null) return "";
+  const v = yearMap.get(maxY);
+  return (v === null || v === undefined || !Number.isFinite(v)) ? "" : v;
+}
+
+function _rowsToObjects(rows){
+  if(!rows || rows.length < 2) return [];
+  const header = rows[0].map(h => (h||"").trim().replace(/^\uFEFF/, ""));
+  return rows.slice(1).map(r=>{
+    const obj = {};
+    header.forEach((h, idx)=>{ obj[h] = coerceValue(r[idx]); });
+    return obj;
+  }).filter(o => Object.values(o).some(v => String(v||"").trim() !== ""));
+}
+
+async function bootstrapCsvFirst(){
+  // 1) Dashboard economy profiles (names + narratives)
+  const profUrl = "data/dashboard_profiles.csv";
+  const profRes = await fetch(profUrl, { cache:"no-store" });
+  if(!profRes.ok) throw new Error("Failed to load " + profUrl + " (HTTP " + profRes.status + ")");
+  const profTxt = await profRes.text();
+  const profRows = _rowsToObjects(parseCSV(profTxt));
+
+  // Require these columns (otherwise dashboard list will be empty)
+  if(!profRows.length || !("Economy" in profRows[0]) || !("economy_code" in profRows[0])){
+    throw new Error("dashboard_profiles.csv must include columns: Economy, economy_code");
+  }
+
+  // 2) Projection baseline
+  const projUrl = "data/projection_baseline.csv";
+  const projRes = await fetch(projUrl, { cache:"no-store" });
+  if(!projRes.ok) throw new Error("Failed to load " + projUrl + " (HTTP " + projRes.status + ")");
+  const projTxt = await projRes.text();
+  const projRows = _rowsToObjects(parseCSV(projTxt));
+
+  const projMap = new Map(); // ecoCode -> Map(indicator_id -> value)
+  projRows.forEach(r=>{
+    const eco = String(r.economy_code||"").trim();
+    const id  = String(r.indicator_id||"").trim();
+    const val = (r.value === "" || r.value === null || r.value === undefined) ? "" : r.value;
+    if(!eco || !id) return;
+    if(!projMap.has(eco)) projMap.set(eco, new Map());
+    projMap.get(eco).set(id, val);
+  });
+
+  // 3) Trends master (also carries latest snapshot values for supported indicators)
+  const trends = await loadPilotTrends(); // uses PILOT_TRENDS_CSV_PRIMARY / FALLBACK
+  const byEco = trends.byEco;
+
+  // 4) Build DATA rows (20 economies) using indicator IDs already expected by v8 UI
+  const out = [];
+  for(const p of profRows){
+    const ecoCode = String(p.economy_code||"").trim();
+    const row = {
+      Economy: p.Economy || "",
+      Flags_top4: p.Flags_top4 || "",
+      General_summary: p.General_summary || "",
+      Challenges_summary: p.Challenges_summary || "",
+    };
+
+    // latest (official)
+    for(const ind of INDICATORS){
+      row[ind.id] = _latestValueFromByEco(byEco, ecoCode, ind.id);
+      // projection placeholder
+      if(ind.proj){
+        const m = projMap.get(ecoCode);
+        row[ind.proj] = (m && m.has(ind.proj)) ? m.get(ind.proj) : "";
+      }
+    }
+
+    out.push(row);
+  }
+
+  DATA = out;
+  state.sourceFile = "CSV-first runtime";
+}
+
+
+bootstrapCsvFirst()
+  .then(()=>{ init(); })
+  .catch((err)=>{
+    console.error(err);
+    // As a safety net, fall back to packaged data.js if it was loaded.
+    // If not loaded, the UI will show Coming soon for missing values.
+    try{ showToast("CSV load failed; falling back to packaged data."); }catch(e){}
+    init();
+  });
